@@ -1,0 +1,25 @@
+# Example: fail the build if your API relay starts serving a substituted model.
+# Copy into your own repo's .github/workflows/ and set RELAY_URL / RELAY_KEY secrets.
+name: relay-guard
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+jobs:
+  verify-relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Fetch relay-guard
+        run: curl -sO https://raw.githubusercontent.com/REPLACE_ORG/relay-guard/main/relay_check.py
+      - name: Verify upstream model
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_KEY: ${{ secrets.RELAY_KEY }}
+        run: |
+          python3 relay_check.py --json \
+            --base-url "$RELAY_URL" --key "$RELAY_KEY" \
+            --model claude-sonnet-4-6 --claim claude
+          # exit code: 0 = ok / uncertain, 2 = MISMATCH_SUSPECTED -> build fails
