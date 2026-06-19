@@ -1,14 +1,14 @@
 # relay-guard
 
 **你的中转站(API relay)真的在跑你付费的模型吗?**
-一行命令验真。零依赖,你的 key 全程不出本机。
+一行命令验真。零依赖。**你的 key 全程不出本机。**
 
-[English →](./README.md) · [网页版(免费深度核验)→](https://panshi.io/zh/relay-check)
+[English →](./README.md) · [网页版 →](https://panshi.io/zh/relay-check)
 
 ---
 
 API 中转站到处都是——便宜,但有些会偷偷把你付费的贵模型(Claude / GPT / Gemini)
-换成便宜模型,赚差价。你要 `claude-sonnet-4-6`,它给你一个套了壳的廉价模型。
+换成便宜模型赚差价。你要 `claude-sonnet-4-6`,它给你一个套了壳的廉价模型。
 `relay-guard` 帮你查上游到底是不是真货。
 
 ## 快速开始
@@ -29,48 +29,41 @@ python3 relay_check.py \
   --claim claude
 ```
 
-## 它怎么查
-
-默认跑**本地鲁棒信号**——全部在你本机完成,什么都不上传:
-
-| 信号 | 抓什么 |
-|---|---|
-| **logprob 能力** | Anthropic 和 Google 的原生 API 不返回 token logprobs。若中转站*声称* Claude/Gemini 却返回了 logprobs,上游几乎肯定是被换成的 OpenAI 兼容模型。 |
-| **自报身份泄漏** | 直接问模型谁造的它。一个自称 "Claude" 却说"我是 DeepSeek-R1"的,自己就招了。 |
-| **模型枚举** | 列出这个 key 实际能访问的模型。 |
-
-这些信号**不真的跑真模型就伪造不了**,而且工具刻意保守:宁可返回 `UNCERTAIN`,
-也绝不冤判一个真端点。
-
 ```
 ==========================================================
   ⚠️ MISMATCH_SUSPECTED  Mismatch suspected / 疑似不符·掺水嫌疑
      Verdict / 检测结论
 ==========================================================
   Claimed / 你标称   : anthropic
-  Detected / 实测    : deepseek
-  Note / 说明        : claimed anthropic but endpoint returned token logprobs …
+  Detected / 实测    : non-official-backend
+  Note / 说明        : 端点特征与真 Claude 后端不符 …
 ```
 
-## 免费本地 vs 深度核验
+## 工作原理(以及为什么可信)
 
-本地信号抓**懒惰**的掺水。但高级中转站能用 prompt 注入让廉价模型*假装*成 Claude
-——本地风格检查可能被骗。要给这种情形一锤定音,需要**中转站无法伪造的加密级核验**:
+这是一个**可审计的瘦客户端**——整个工具就是一个你能从头读到尾的 Python 文件:
 
-```bash
-python3 relay_check.py --deep ...   # 加 panshi.io 指纹 + 签名验真
-```
+1. 它从 panshi.io 拉一组题目;
+2. 它拿这些题问**你自己的**中转站;
+3. 它只把**回答**上传给 panshi.io,由服务端返回判定结论。
 
-| | 本地(本 CLI) | 深度核验([panshi.io](https://panshi.io/zh/relay-check)) |
+**你的中转站 key 绝不上传。** 读代码就知道:key 只会进到请求*你自己* `--base-url`
+的 `Authorization` 头里,别的地方都碰不到你的 key。
+
+检测引擎本身(怎么给回答打分)刻意跑在服务端——既防掺水中转站研究它来规避,
+也因为这部分由 [panshi.io](https://panshi.io/zh/relay-check) 持续维护、随模型更新。
+
+## 免费抽检 vs 持续监控
+
+CLI(和[网页版](https://panshi.io/zh/relay-check))给你免费的按需**抽检**。但抽检只是
+快照——中转站今天能过,明天就能换后端。要持续保护:
+
+| | 本 CLI / 网页 | [panshi.io](https://panshi.io/zh/relay-check) 付费 |
 |---|---|---|
-| 隐私 | key 和回答都留本地 | 只上传回答,绝不上传 key |
-| 抓懒惰掺水 | ✅ | ✅ |
-| 抓 persona 伪装 | ⚠️ 部分 | ✅ 统计指纹 |
-| 加密级模型证明 | ✗ | ✅ 无法伪造的签名往返 |
-| 持续监控 | ✗ | ✅ |
-
-深度引擎(统计指纹、签名往返)按设计跑在服务端——既防中转站研究它来规避,
-也因为这部分由 [panshi.io](https://panshi.io/zh/relay-check) 作为服务持续维护。
+| 按需检测 | ✅ 免费 | ✅ |
+| 加密级深度核验(无法伪造) | 部分 | ✅ |
+| 持续监控 + 告警 | ✗ | ✅ |
+| 多上游看板 | ✗ | ✅ |
 
 ## 用于 CI
 
@@ -87,8 +80,8 @@ python3 relay_check.py --deep ...   # 加 panshi.io 指纹 + 签名验真
 
 ## 诚实的边界
 
-这是概率工具,**不是法律证据**。量化/蒸馏的劣化版、以及参考库外的模型可能无法判定。
-`LIKELY_GENUINE` 只降低嫌疑,不是保证。事关重大时,请用加密级深度核验。
+概率工具,**不是法律证据**。量化/蒸馏劣化版、参考集外的模型可能无法判定。
+`LIKELY_GENUINE` 只降低嫌疑,不是保证。事关重大时请用加密级深度核验。
 
 ## 协议
 

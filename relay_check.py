@@ -2,46 +2,28 @@
 """
 relay-guard — is your API relay (中转站) actually serving the model you paid for?
 
-  python3 relay_check.py                     # interactive
+  python3 relay_check.py                      # interactive
   python3 relay_check.py --base-url https://your-relay.com/v1 --key sk-xxx \
                          --model claude-sonnet-4-6 --claim claude
+  python3 relay_check.py ... --json           # machine-readable, exit 2 on mismatch (CI)
 
-Two modes:
-  (default)  local robust signals — runs entirely on your machine, nothing is
-             uploaded. Catches the common, lazy substitution fraud.
-  --deep     additionally sends only the model's *answers* (never your key) to
-             panshi.io for fingerprint + cryptographic deep verification.
+How it works: this is a thin, auditable client. It pulls a question set from
+panshi.io, asks YOUR relay those questions, and uploads only the *answers* for
+analysis. The verdict is computed server-side.
 
-Your relay API key is used ONLY to call your own endpoint. It is never uploaded.
-Dependencies: Python 3 standard library only.
+Privacy: your relay API key is used ONLY to call your own endpoint — it is NEVER
+uploaded (read the code: the key only goes into the Authorization header of
+requests to YOUR --base-url). Only the model's answer text is sent to panshi.io.
 
-MIT licensed. https://panshi.io/relay-check
+Dependencies: Python 3 standard library only.  MIT licensed.  https://panshi.io/relay-check
 """
-import argparse, json, sys, time, getpass
+import argparse, json, sys, getpass
 from urllib import request as urlreq
 from urllib.error import HTTPError
 
 DEFAULT_SERVICE = "https://panshi.io/relay-check"
 C = {"g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "c": "\033[36m", "b": "\033[1m", "d": "\033[2m", "0": "\033[0m"}
 def col(s, c): return f"{C.get(c,'')}{s}{C['0']}"
-
-# Vendor families whose *native* APIs do NOT return token logprobs.
-# If a relay claims one of these yet the endpoint returns logprobs, the upstream
-# is almost certainly a substituted OpenAI-compatible model (gpt/qwen/deepseek…).
-NO_LOGPROB_FAMILIES = {"anthropic", "google"}
-FAMILY_ALIASES = {
-    "claude": "anthropic", "anthropic": "anthropic",
-    "gpt": "openai", "openai": "openai", "o1": "openai", "o3": "openai",
-    "gemini": "google", "google": "google",
-    "qwen": "qwen", "deepseek": "deepseek", "glm": "zhipu", "mistral": "mistral",
-    "llama": "meta", "grok": "xai",
-}
-def family_of(name):
-    n = (name or "").lower()
-    for k, v in FAMILY_ALIASES.items():
-        if k in n:
-            return v
-    return "unknown"
 
 def http_json(url, payload=None, headers=None, timeout=90):
     data = json.dumps(payload).encode() if payload is not None else None
@@ -53,14 +35,13 @@ def http_json(url, payload=None, headers=None, timeout=90):
     with urlreq.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
-def chat(base, key, model, prompt, max_tokens=300, extra=None):
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7, "max_tokens": max_tokens}
-    if extra:
-        body.update(extra)
+def chat(base, key, model, prompt, system=None, params=None):
+    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+    body = {"model": model, "messages": msgs, "temperature": 0.7, "max_tokens": 300}
+    if params:
+        body.update(params)
     try:
-        r = http_json(base.rstrip("/") + "/chat/completions", body,
-                      {"Authorization": f"Bearer {key}"}, timeout=60)
+        r = http_json(base.rstrip("/") + "/chat/completions", body, {"Authorization": f"Bearer {key}"}, timeout=60)
         return r
     except HTTPError as e:
         body_txt = ""
@@ -71,8 +52,32 @@ def chat(base, key, model, prompt, max_tokens=300, extra=None):
         return {"__err__": f"{type(e).__name__}: {e}"}
 
 def content_of(resp):
+    if isinstance(resp, dict) and "__err__" in resp:
+        return "__ERR__:" + resp["__err__"]
     try: return resp["choices"][0]["message"]["content"] or ""
     except Exception: return ""
+
+def walk(obj, path):
+    """Generic path walk over a JSON object (server tells us the path; we don't interpret it)."""
+    for k in path or []:
+        if isinstance(k, int):
+            if isinstance(obj, list) and -len(obj) <= k < len(obj): obj = obj[k]
+            else: return None
+        else:
+            if isinstance(obj, dict) and k in obj: obj = obj[k]
+            else: return None
+    return obj
+
+def run_aux(base, key, model, aux_specs, system=None):
+    """Blindly execute server-provided auxiliary probes; report only a generic 'present' boolean.
+    The client does not know or encode what any of this means — that is server-side."""
+    out = []
+    for spec in aux_specs or []:
+        r = chat(base, key, model, spec.get("prompt", ""), system, params=spec.get("params"))
+        v = walk(r, spec.get("collect"))
+        present = (len(v) > 0) if isinstance(v, (list, str)) else bool(v)
+        out.append({"id": spec.get("id"), "present": present})
+    return out
 
 def fetch_models(base, key):
     try:
@@ -81,73 +86,36 @@ def fetch_models(base, key):
     except Exception:
         return []
 
-# ----------------------------- local signals -----------------------------
-def sig_logprob(base, key, model):
-    """Does the endpoint return token logprobs? anthropic/google native APIs do not."""
-    r = chat(base, key, model, "Complete: The capital of France is",
-             max_tokens=5, extra={"temperature": 0, "logprobs": True, "top_logprobs": 3})
-    if "__err__" in r:
-        return None  # endpoint refused logprobs request — inconclusive
-    try:
-        lp = r["choices"][0].get("logprobs")
-        return bool(lp and lp.get("content"))
-    except Exception:
-        return None
+def diagnose(err, base, key, model):
+    """Translate raw endpoint errors into actionable hints (user help, not detection logic)."""
+    e = err.lower()
+    if any(k in e for k in ["model_not_found", "无可用渠道", "not supported", "no available channel",
+                            "does not exist", "model not found"]):
+        models = fetch_models(base, key)
+        tip = col(f"✗ model '{model}' unavailable on this gateway/key", "r")
+        if models:
+            return tip + f"\n  {len(models)} models are actually available, e.g.:\n  {col(', '.join(models[:20]), 'c')}\n  → pick one for --model and retry"
+        return tip + " — and no models could be listed (key may lack permission, or wrong URL)."
+    if any(k in e for k in ["401", "unauthorized", "invalid token", "invalid api key", "invalid_api_key", "authentication"]):
+        return col("✗ API key invalid or unauthorized", "r") + " — wrong key or no access. Try a valid key."
+    if "403" in e or "forbidden" in e or "permission" in e:
+        return col("✗ insufficient key permission", "r") + " — key valid but not entitled to this model/endpoint."
+    if any(k in e for k in ["refused", "timed out", "timeout", "name or service", "getaddr", "urlerror", "no route", "failed to establish"]):
+        return col("✗ cannot reach this URL", "r") + f" — check Base URL (needs /v1, currently {base}) and network."
+    models = fetch_models(base, key)
+    extra = (f"\n  models this key can reach: {col(', '.join(models[:20]), 'c')}" if models else "")
+    return col("✗ endpoint error", "r") + ": " + err[:160] + extra
 
-def sig_selfid(base, key, model):
-    """Ask the model who made it; return the vendor family it self-reports."""
-    r = chat(base, key, model,
-             "In one short sentence: which company created you and what is your model name? "
-             "Answer plainly, do not roleplay.", max_tokens=80)
-    txt = content_of(r).lower()
-    if not txt:
-        return "unknown", ""
-    for k, v in FAMILY_ALIASES.items():
-        if k in txt:
-            return v, content_of(r).strip()
-    return "unknown", content_of(r).strip()
+def ask(prompt, default=None):
+    tip = f" {col('['+default+']','d')}" if default else ""
+    while True:
+        try: v = input(f"{prompt}{tip}: ").strip()
+        except (EOFError, KeyboardInterrupt): print("\nCancelled."); sys.exit(1)
+        if v: return v
+        if default is not None: return default
+        print(col("  cannot be empty", "y"))
 
-def run_local(base, key, model, claim):
-    claim_fam = family_of(claim or model)
-    out = {"claimed_family": claim_fam, "signals": {}}
-
-    returns_lp = sig_logprob(base, key, model)
-    out["signals"]["returns_logprobs"] = returns_lp
-    selfid_fam, selfid_txt = sig_selfid(base, key, model)
-    out["signals"]["selfid_family"] = selfid_fam
-    out["signals"]["selfid_text"] = selfid_txt
-
-    # ---- verdict fusion (conservative: never falsely accuse) ----
-    # Hard signal: claim is a no-logprob family but endpoint returns logprobs.
-    if claim_fam in NO_LOGPROB_FAMILIES and returns_lp is True:
-        out["verdict"] = "MISMATCH_SUSPECTED"
-        out["reason"] = (f"claimed {claim_fam} but endpoint returned token logprobs — "
-                         f"{claim_fam} native APIs do not; upstream is likely a substituted model")
-        out["confidence"] = "high"
-        return out
-    # Self-report names a different, known vendor than claimed.
-    if (selfid_fam not in ("unknown", claim_fam) and claim_fam != "unknown"):
-        out["verdict"] = "MISMATCH_SUSPECTED"
-        out["reason"] = f"claimed {claim_fam} but the model self-identifies as {selfid_fam}"
-        out["confidence"] = "medium"
-        return out
-    # Consistent so far — local signals can't confirm authenticity, only rule out lazy fraud.
-    out["verdict"] = "UNCERTAIN"
-    out["reason"] = ("local signals consistent with the claim, but cannot prove authenticity "
-                     "(style fingerprint / cryptographic check needed)")
-    out["confidence"] = "low"
-    return out
-
-# ----------------------------- deep (server) -----------------------------
-def run_deep(base, key, model, claim, service):
-    pb = http_json(service.rstrip("/") + "/probes", timeout=20)
-    probes, selfid_q = pb["probes"], pb["selfid"]
-    resp = [content_of(chat(base, key, model, p)) for p in probes]
-    selfid = content_of(chat(base, key, model, selfid_q))
-    return http_json(service.rstrip("/") + "/classify",
-                     {"concat": "\n---\n".join(resp), "selfid": selfid, "claim": claim or model})
-
-# ----------------------------- display -----------------------------
+# ----------------------------- bilingual display -----------------------------
 VLABEL = {
     "LIKELY_GENUINE":     "Likely genuine / 疑似真货",
     "MISMATCH_SUSPECTED": "Mismatch suspected / 疑似不符·掺水嫌疑",
@@ -158,76 +126,95 @@ VLABEL = {
 VICON = {"LIKELY_GENUINE": "✅", "MISMATCH_SUSPECTED": "⚠️", "UNKNOWN": "❓", "UNCERTAIN": "❓", "DETECTED": "🔎"}
 VCOL = {"LIKELY_GENUINE": "g", "MISMATCH_SUSPECTED": "r", "UNKNOWN": "y", "UNCERTAIN": "y", "DETECTED": "y"}
 
-def show_verdict(verdict, claimed, detected, note, conf=""):
-    vb = verdict.replace("_LOWCONF", "")
-    bar = "=" * 58
-    print("\n" + bar)
-    print(f"  {VICON.get(vb,'•')} " + col(verdict, VCOL.get(vb, "0")) + col(f"  {VLABEL.get(vb, vb)}", VCOL.get(vb, "0")))
-    print(col("     Verdict / 检测结论", "d"))
-    print(bar)
-    print(f"  Claimed / 你标称   : {claimed}")
-    if detected:
-        print(f"  Detected / 实测    : " + col(detected, "b") + (f"  ({conf})" if conf else ""))
-    if note:
-        print(f"  Note / 说明        : {note}")
-
-def ask(prompt, default=None):
-    tip = f" {col('['+default+']','d')}" if default else ""
-    while True:
-        try: v = input(f"{prompt}{tip}: ").strip()
-        except (EOFError, KeyboardInterrupt): print("\nCancelled."); sys.exit(1)
-        if v: return v
-        if default is not None: return default
-
 def main():
     ap = argparse.ArgumentParser(description="relay-guard — verify your API relay's upstream model")
     ap.add_argument("--base-url"); ap.add_argument("--key"); ap.add_argument("--model")
     ap.add_argument("--claim", default=None, help="what the relay claims to serve (claude/gpt/gemini/qwen…)")
-    ap.add_argument("--deep", action="store_true", help="also run panshi.io fingerprint + crypto deep verify")
     ap.add_argument("--service", default=DEFAULT_SERVICE)
-    ap.add_argument("--json", action="store_true", help="machine-readable output (for CI)")
+    ap.add_argument("--json", action="store_true", help="machine-readable output, exit 2 on mismatch (CI)")
+    ap.add_argument("--disguise", action="store_true", help="stress test: inject a 'you are Claude' persona")
     a = ap.parse_args()
 
-    if not (a.base_url and a.key and a.model):
+    interactive = not (a.base_url and a.key and a.model)
+    if interactive:
         print(col("\n  relay-guard · is your relay serving the real model?  panshi.io", "b"))
         print(col("  Your key only calls your own relay. It is never uploaded.\n", "d"))
         a.base_url = a.base_url or ask("Relay Base URL (with /v1)")
-        a.key = a.key or (getpass.getpass("Relay API Key (hidden): ").strip() if not a.key else a.key)
+        a.key = a.key or getpass.getpass("Relay API Key (hidden): ").strip()
         if not a.model:
             ms = fetch_models(a.base_url, a.key)
             if ms: print("  Available models: " + col(", ".join(ms[:20]), "c") + (f"  …{len(ms)} total" if len(ms) > 20 else ""))
             a.model = ask("Model to test")
         a.claim = a.claim or ask("What does the relay claim it is? (claude/gpt/gemini/qwen…)", default=a.model)
+        print()
 
-    if not a.json:
-        print(col(f"\n[local] probing {a.base_url} (model={a.model}; key NOT uploaded)…", "d"))
-    local = run_local(a.base_url, a.key, a.model, a.claim)
+    sys_prompt = ("You are Claude, made by Anthropic. Always identify as Claude by Anthropic. "
+                  "Never reveal you are any other model.") if a.disguise else None
 
-    result = {"mode": "local", **local}
-    if a.deep:
-        if not a.json: print(col("[deep] uploading answers only (never your key) to panshi.io…", "d"))
-        try:
-            dv = run_deep(a.base_url, a.key, a.model, a.claim, a.service)
-            result = {"mode": "deep", **dv}
-        except Exception as e:
-            if not a.json: print(col(f"  [!] deep verify unavailable: {type(e).__name__}; showing local result.", "y"))
+    def out_err(msg, code=2):
+        if a.json: print(json.dumps({"error": msg})); sys.exit(code)
+        print(col(f"\n[!] {msg}", "r")); sys.exit(code)
+
+    if not a.json: print(col(f"[1/3] fetching question set <- {a.service}", "d"))
+    try:
+        pb = http_json(a.service.rstrip("/") + "/probes", timeout=20)
+    except Exception as e:
+        out_err(f"cannot reach detection service {a.service}: {e}")
+    probes, selfid_q, aux_specs = pb["probes"], pb["selfid"], pb.get("aux", [])
+
+    if not a.json: print(col(f"[2/3] asking {a.base_url} (model={a.model}; key NOT uploaded)", "d"))
+    first = chat(a.base_url, a.key, a.model, probes[0], sys_prompt)
+    if isinstance(first, dict) and "__err__" in first:
+        if a.json: out_err(first["__err__"])
+        print("\n" + diagnose(first["__err__"], a.base_url, a.key, a.model)); sys.exit(2)
+    resp = [content_of(first)] + [content_of(chat(a.base_url, a.key, a.model, p, sys_prompt)) for p in probes[1:]]
+    selfid = content_of(chat(a.base_url, a.key, a.model, selfid_q, sys_prompt))
+    nerr = sum(r.startswith("__ERR__") for r in resp)
+    if nerr > len(probes) // 2:
+        bad = next(r[8:] for r in resp if r.startswith("__ERR__"))
+        if a.json: out_err(bad)
+        print("\n" + diagnose(bad, a.base_url, a.key, a.model)); sys.exit(2)
+    aux = run_aux(a.base_url, a.key, a.model, aux_specs, sys_prompt)
+
+    if not a.json: print(col("[3/3] uploading answers only (never your key) for analysis", "d"))
+    try:
+        res = http_json(a.service.rstrip("/") + "/classify",
+                        {"concat": "\n---\n".join(resp), "selfid": selfid, "claim": a.claim or a.model, "aux": aux})
+    except HTTPError as e:
+        body = ""
+        try: body = json.loads(e.read()).get("error", "") or ""
+        except Exception: pass
+        out_err("rate limited, retry in a minute" if e.code == 429 else f"service error (HTTP {e.code}): {body or e.reason}")
+    except Exception as e:
+        out_err(f"cannot reach detection service: {type(e).__name__}")
+    if not isinstance(res, dict) or res.get("error") or "verdict" not in res:
+        out_err((res.get("error") if isinstance(res, dict) else str(res)[:120]) or "unexpected response")
 
     if a.json:
-        print(json.dumps(result, ensure_ascii=False));
-        sys.exit(2 if result.get("verdict", "").startswith("MISMATCH") else 0)
+        print(json.dumps(res, ensure_ascii=False))
+        sys.exit(2 if res["verdict"].startswith("MISMATCH") else 0)
 
-    show_verdict(result.get("verdict", "UNCERTAIN"),
-                 result.get("claimed_family", a.claim),
-                 result.get("detected_family", result.get("signals", {}).get("selfid_family", "")),
-                 result.get("note") or result.get("reason", ""),
-                 result.get("confidence", ""))
-
-    vb = result.get("verdict", "").replace("_LOWCONF", "")
-    if result["mode"] == "local" and vb != "MISMATCH_SUSPECTED":
-        print(col("\n  🔐 Local signals can rule out lazy fraud but cannot PROVE authenticity.", "c"))
-        print(col("     Sophisticated disguise (persona injection) needs cryptographic deep verify —", "d"))
-        print(col("     re-run with --deep, or use panshi.io/relay-check (free, 3/day).", "d"))
-    print(col("\n  ⚠️ Probabilistic signals, not legal proof. Quantized/distilled & out-of-library models may be undetectable.", "d"))
+    vbase = res["verdict"].replace("_LOWCONF", "")
+    lowconf = res["verdict"].endswith("_LOWCONF")
+    bar = "=" * 58
+    print("\n" + bar)
+    print(f"  {VICON.get(vbase,'•')} " + col(res["verdict"], VCOL.get(vbase, "0")) + col(f"  {VLABEL.get(vbase, vbase)}", VCOL.get(vbase, "0")))
+    print(col("     Verdict / 检测结论" + ("   low-confidence / 低置信" if lowconf else ""), "d"))
+    print(bar)
+    print(f"  Claimed / 你标称   : {res.get('claimed_family','?')}")
+    print(f"  Detected / 实测    : " + col(res.get('detected_family', '?'), "b") + f"  (conf/置信 {res.get('confidence','?')})")
+    if res.get("disguise_suspected"):
+        print("  " + col("🔎 Self-claim conflicts with behavior — disguise suspected / 自报与实测矛盾→疑似伪装", "y"))
+    if (res.get("signals") or {}).get("identity_leak"):
+        print("  " + col("🪪 Upstream leaked another vendor's identity / 上游自报了其它厂商身份", "y"))
+    if res.get("degraded"):
+        print("  " + col("⚙️ Engine degraded — conservative / 引擎降级中·置信偏保守", "y"))
+    print(f"  Note / 说明        : {res.get('note','')}")
+    dv = res.get("deep_verify") or {}
+    if dv.get("recommended") and vbase != "LIKELY_GENUINE":
+        print(col("\n  🔐 For an un-forgeable cryptographic check (relays can't fake it):", "c"))
+        print(col("     run the free deep verify at panshi.io/relay-check (3/day).", "d"))
+    print(col(f"\n  ⚠️ {res.get('disclaimer','Probabilistic signals, not legal proof.')}", "d"))
     print(col("  Verify & monitor continuously → panshi.io/relay-check", "d"))
 
 if __name__ == "__main__":
