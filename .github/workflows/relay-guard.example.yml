@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.x"
       - name: Fetch relay-guard
-        run: curl -sO https://raw.githubusercontent.com/REPLACE_ORG/relay-guard/main/relay_check.py
+        run: curl -sO https://raw.githubusercontent.com/akige/relay-guard/main/relay_check.py
       - name: Verify upstream model
         env:
           RELAY_URL: ${{ secrets.RELAY_URL }}

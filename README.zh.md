@@ -15,7 +15,7 @@ API 中转站到处都是——便宜,但有些会偷偷把你付费的贵模型
 
 ```bash
 # 免安装,只需 Python 3
-curl -O https://raw.githubusercontent.com/<org>/relay-guard/main/relay_check.py
+curl -O https://raw.githubusercontent.com/akige/relay-guard/main/relay_check.py
 python3 relay_check.py
 ```
 

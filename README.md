@@ -16,7 +16,7 @@ trench coat. `relay-guard` checks whether your upstream is the real thing.
 
 ```bash
 # no install — just Python 3
-curl -O https://raw.githubusercontent.com/<org>/relay-guard/main/relay_check.py
+curl -O https://raw.githubusercontent.com/akige/relay-guard/main/relay_check.py
 python3 relay_check.py
 ```
 
