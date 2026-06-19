@@ -1,5 +1,7 @@
 # relay-guard
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE) ![Python 3](https://img.shields.io/badge/python-3.x-blue.svg) ![deps: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+
 **Is your API relay (中转站) actually serving the model you paid for?**
 One command to find out. Zero dependencies. **Your key never leaves your machine.**
 

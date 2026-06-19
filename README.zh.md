@@ -1,5 +1,7 @@
 # relay-guard
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE) ![Python 3](https://img.shields.io/badge/python-3.x-blue.svg) ![deps: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+
 **你的中转站(API relay)真的在跑你付费的模型吗?**
 一行命令验真。零依赖。**你的 key 全程不出本机。**
 
